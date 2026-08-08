@@ -1,0 +1,6 @@
+gradio
+spaces
+torch
+transformers
+accelerate
+google-genai
