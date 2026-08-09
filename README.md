@@ -1,3 +1,13 @@
+---
+title: Diffusion Gemma Showdown
+emoji: 🥊
+colorFrom: blue
+colorTo: purple
+sdk: gradio
+app_file: app.py
+pinned: false
+---
+
 # Diffusion Gemma Showdown
 
 Two AI models. Same broken paragraph. One has to rewrite everything after the mistake — the other, in theory, only touches the broken words.
