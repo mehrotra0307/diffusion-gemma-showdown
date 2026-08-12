@@ -192,4 +192,8 @@ with gr.Blocks(title="Diffusion Gemma Showdown", css=CUSTOM_CSS) as demo:
     )
 
 if __name__ == "__main__":
+    # Gradio only runs one queued event at a time app-wide by default, which meant
+    # our two model calls were secretly taking turns instead of running side by
+    # side — whichever was slow silently blocked the other from starting at all.
+    demo.queue(default_concurrency_limit=2)
     demo.launch()
