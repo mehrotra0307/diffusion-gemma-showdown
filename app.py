@@ -115,7 +115,7 @@ def stream_gemma4(paragraph: str):
         yield "### Gemma 4 (autoregressive) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
 
 
-@spaces.GPU(duration=90, size="xlarge")
+@spaces.GPU(duration=45, size="xlarge")
 def fix_with_diffusiongemma(paragraph: str) -> str:
     """Plain, blocking call — no streaming, no background thread. This is the
     exact pattern that ran in ~10 seconds before streaming was added."""
@@ -129,7 +129,7 @@ def fix_with_diffusiongemma(paragraph: str) -> str:
     prompt_token_count = inputs["input_ids"].shape[-1]
     print(f"[diffusiongemma] prompt tokenized at {time.monotonic() - start:.1f}s, calling generate()", flush=True)
 
-    output = diff_model.generate(**inputs, max_new_tokens=512)
+    output = diff_model.generate(**inputs, max_new_tokens=160)
     print(f"[diffusiongemma] generate() returned at {time.monotonic() - start:.1f}s", flush=True)
     generated_tokens = output[0][prompt_token_count:]
     text = diff_processor.decode(generated_tokens, skip_special_tokens=True)
