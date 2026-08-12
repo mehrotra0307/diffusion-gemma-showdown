@@ -1,7 +1,6 @@
 import os
 import time
 import difflib
-import concurrent.futures
 
 import gradio as gr
 import spaces
@@ -10,7 +9,6 @@ from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor
 
 GEMMA4_MODEL_ID = "gemma-4-26b-a4b-it"
 DIFFUSIONGEMMA_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
-GEMMA4_CHUNK_TIMEOUT_SECONDS = 45
 
 _LEADING_ROLE_MARKERS = ("user", "model", "thought")
 
@@ -64,88 +62,66 @@ def word_diff_html(original: str, fixed: str):
     return " ".join(html_parts), pct
 
 
-def _gemma4_chunk_generator(paragraph: str):
-    """Runs in a worker thread. A plain generator wrapping the SDK call — all the
-    timeout/logging logic lives in stream_gemma4, which pulls from this one item
-    at a time so a stuck network call can't hang the app forever."""
+def fix_with_gemma4(paragraph: str) -> str:
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    for chunk in client.models.generate_content_stream(
+    response = client.models.generate_content(
         model=GEMMA4_MODEL_ID,
         contents=f"{FIX_INSTRUCTION}\n\n{paragraph}",
-    ):
-        if chunk.text:
-            yield chunk.text
-
-
-def stream_gemma4(paragraph: str):
-    """Yields (label, html) repeatedly as Gemma 4's answer streams in, word by word.
-    Each individual step is bounded by GEMMA4_CHUNK_TIMEOUT_SECONDS so a stuck
-    network call fails loudly instead of hanging indefinitely."""
-    if not paragraph.strip():
-        yield "### Gemma 4 (autoregressive)", ""
-        return
-
-    start = time.monotonic()
-    print(f"[gemma4] request starting", flush=True)
-    try:
-        partial = ""
-        gen = _gemma4_chunk_generator(paragraph)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            while True:
-                future = executor.submit(next, gen, None)
-                try:
-                    chunk_text = future.result(timeout=GEMMA4_CHUNK_TIMEOUT_SECONDS)
-                except concurrent.futures.TimeoutError:
-                    elapsed = time.monotonic() - start
-                    print(f"[gemma4] TIMED OUT waiting for next chunk, elapsed={elapsed:.1f}s", flush=True)
-                    raise TimeoutError(
-                        f"No response from Gemma 4 for {GEMMA4_CHUNK_TIMEOUT_SECONDS}s "
-                        f"(request running {elapsed:.1f}s total)"
-                    )
-                if chunk_text is None:
-                    break
-                partial += chunk_text
-                elapsed = time.monotonic() - start
-                print(f"[gemma4] chunk at {elapsed:.1f}s: {chunk_text[:60]!r}", flush=True)
-                html, pct = word_diff_html(paragraph, partial)
-                yield f"### Gemma 4 (autoregressive) — {pct}% of words changed so far", html
-        print(f"[gemma4] done in {time.monotonic() - start:.1f}s", flush=True)
-    except Exception as e:
-        print(f"[gemma4] ERROR after {time.monotonic() - start:.1f}s: {type(e).__name__}: {e}", flush=True)
-        yield "### Gemma 4 (autoregressive) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
+    )
+    return response.text.strip()
 
 
 @spaces.GPU(duration=45, size="xlarge")
 def fix_with_diffusiongemma(paragraph: str) -> str:
-    """Plain, blocking call — no streaming, no background thread. This is the
-    exact pattern that ran in ~10 seconds before streaming was added."""
-    start = time.monotonic()
-    print(f"[diffusiongemma] request starting", flush=True)
     messages = [{"role": "user", "content": f"{FIX_INSTRUCTION}\n\n{paragraph}"}]
     inputs = diff_processor.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True,
         return_dict=True, return_tensors="pt",
     ).to(diff_model.device)
     prompt_token_count = inputs["input_ids"].shape[-1]
-    print(f"[diffusiongemma] prompt tokenized at {time.monotonic() - start:.1f}s, calling generate()", flush=True)
 
     output = diff_model.generate(**inputs, max_new_tokens=160)
-    print(f"[diffusiongemma] generate() returned at {time.monotonic() - start:.1f}s", flush=True)
     generated_tokens = output[0][prompt_token_count:]
     text = diff_processor.decode(generated_tokens, skip_special_tokens=True)
-    print(f"[diffusiongemma] done in {time.monotonic() - start:.1f}s", flush=True)
     return _strip_leading_role_markers(text.strip())
 
 
-def run_diffusiongemma(paragraph: str):
+def run_comparison(paragraph: str):
+    """Runs Gemma 4 first (light network call, seconds) then DiffusionGemma
+    second (heavy GPU work). Deliberately sequential, not concurrent — running
+    them at the same time in one process let the heavy DiffusionGemma work
+    starve Gemma 4's network response of CPU time, making it look hung."""
     if not paragraph.strip():
-        return "### DiffusionGemma (block diffusion)", ""
+        yield "### Gemma 4 (autoregressive)", "", "### DiffusionGemma (block diffusion)", ""
+        return
+
+    start = time.monotonic()
+    print("[gemma4] request starting", flush=True)
     try:
-        fix = fix_with_diffusiongemma(paragraph)
-        html, pct = word_diff_html(paragraph, fix)
-        return f"### DiffusionGemma (block diffusion) — {pct}% of words changed", html
+        gemma4_fix = fix_with_gemma4(paragraph)
+        gemma4_html, gemma4_pct = word_diff_html(paragraph, gemma4_fix)
+        gemma4_label = f"### Gemma 4 (autoregressive) — {gemma4_pct}% of words changed"
+        print(f"[gemma4] done in {time.monotonic() - start:.1f}s", flush=True)
     except Exception as e:
-        return "### DiffusionGemma (block diffusion) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
+        gemma4_label = "### Gemma 4 (autoregressive) — request failed"
+        gemma4_html = f"<p><em>{type(e).__name__}: {e}</em></p>"
+        print(f"[gemma4] ERROR after {time.monotonic() - start:.1f}s: {type(e).__name__}: {e}", flush=True)
+
+    yield gemma4_label, gemma4_html, "### DiffusionGemma (block diffusion)", ""
+
+    start = time.monotonic()
+    print("[diffusiongemma] request starting", flush=True)
+    try:
+        diffusion_fix = fix_with_diffusiongemma(paragraph)
+        diffusion_html, diffusion_pct = word_diff_html(paragraph, diffusion_fix)
+        diffusion_label = f"### DiffusionGemma (block diffusion) — {diffusion_pct}% of words changed"
+        print(f"[diffusiongemma] done in {time.monotonic() - start:.1f}s", flush=True)
+    except Exception as e:
+        diffusion_label = "### DiffusionGemma (block diffusion) — request failed"
+        diffusion_html = f"<p><em>{type(e).__name__}: {e}</em></p>"
+        print(f"[diffusiongemma] ERROR after {time.monotonic() - start:.1f}s: {type(e).__name__}: {e}", flush=True)
+
+    yield gemma4_label, gemma4_html, diffusion_label, diffusion_html
 
 
 CUSTOM_CSS = """
@@ -181,19 +157,10 @@ with gr.Blocks(title="Diffusion Gemma Showdown", css=CUSTOM_CSS) as demo:
             diffusion_output = gr.HTML()
 
     run_button.click(
-        fn=stream_gemma4,
+        fn=run_comparison,
         inputs=[input_box],
-        outputs=[gemma4_title, gemma4_output],
-    )
-    run_button.click(
-        fn=run_diffusiongemma,
-        inputs=[input_box],
-        outputs=[diffusion_title, diffusion_output],
+        outputs=[gemma4_title, gemma4_output, diffusion_title, diffusion_output],
     )
 
 if __name__ == "__main__":
-    # Gradio only runs one queued event at a time app-wide by default, which meant
-    # our two model calls were secretly taking turns instead of running side by
-    # side — whichever was slow silently blocked the other from starting at all.
-    demo.queue(default_concurrency_limit=2)
     demo.launch()
