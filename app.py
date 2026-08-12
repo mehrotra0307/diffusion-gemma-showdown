@@ -1,17 +1,14 @@
 import os
 import difflib
-import threading
-import queue
 
 import gradio as gr
 import spaces
 from google import genai
-from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor, TextDiffusionStreamer
+from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor
 
 GEMMA4_MODEL_ID = "gemma-4-26b-a4b-it"
 DIFFUSIONGEMMA_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 
-_STOP = object()
 _LEADING_ROLE_MARKERS = ("user", "model", "thought")
 
 
@@ -32,47 +29,6 @@ def _strip_leading_role_markers(text: str) -> str:
                 changed = True
     return text
 
-
-class QueueDiffusionStreamer(TextDiffusionStreamer):
-    """TextDiffusionStreamer is built to print ANSI colors to a terminal, not to
-    hand data back to code — it isn't iterable at all. This subclass intercepts
-    its two real callbacks (put_draft for in-progress denoising, on_finalized_text
-    for confirmed text) and pushes plain strings into a queue instead, so we can
-    read it like a normal streaming iterator from app.py."""
-
-    def __init__(self, tokenizer, prompt_token_count: int = 0, **kwargs):
-        super().__init__(tokenizer, **kwargs)
-        self.text_queue = queue.Queue()
-        self._confirmed = ""
-        # put_draft() has no built-in prompt-skipping (unlike put()/on_finalized_text,
-        # which respect skip_prompt) — it decodes whatever tensor it's handed. Since
-        # the draft tensor is the whole canvas (prompt + answer together), we slice
-        # off the prompt ourselves using its known token length.
-        self.prompt_token_count = prompt_token_count
-
-    def put_draft(self, value, **kwargs):
-        if len(value.shape) > 1 and value.shape[0] > 1:
-            raise ValueError("QueueDiffusionStreamer only supports batch size 1")
-        elif len(value.shape) > 1:
-            value = value[0]
-        value = value[self.prompt_token_count:]
-        draft_text = self.tokenizer.decode(value, skip_special_tokens=True)
-        self.text_queue.put(_strip_leading_role_markers(draft_text))
-
-    def on_finalized_text(self, text: str, stream_end: bool = False):
-        self._confirmed += text
-        self.text_queue.put(_strip_leading_role_markers(self._confirmed))
-        if stream_end:
-            self.text_queue.put(_STOP)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        value = self.text_queue.get()
-        if value is _STOP:
-            raise StopIteration
-        return value
 
 FIX_INSTRUCTION = (
     "The paragraph below contains exactly one factual or spelling error. "
@@ -126,38 +82,31 @@ def stream_gemma4(paragraph: str):
 
 
 @spaces.GPU(duration=90, size="xlarge")
-def stream_diffusiongemma(paragraph: str):
-    """Yields (label, html) repeatedly as DiffusionGemma denoises the block in place."""
+def fix_with_diffusiongemma(paragraph: str) -> str:
+    """Plain, blocking call — no streaming, no background thread. This is the
+    exact pattern that ran in ~10 seconds before streaming was added."""
+    messages = [{"role": "user", "content": f"{FIX_INSTRUCTION}\n\n{paragraph}"}]
+    inputs = diff_processor.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True,
+        return_dict=True, return_tensors="pt",
+    ).to(diff_model.device)
+    prompt_token_count = inputs["input_ids"].shape[-1]
+
+    output = diff_model.generate(**inputs, max_new_tokens=512)
+    generated_tokens = output[0][prompt_token_count:]
+    text = diff_processor.decode(generated_tokens, skip_special_tokens=True)
+    return _strip_leading_role_markers(text.strip())
+
+
+def run_diffusiongemma(paragraph: str):
     if not paragraph.strip():
-        yield "### DiffusionGemma (block diffusion)", ""
-        return
+        return "### DiffusionGemma (block diffusion)", ""
     try:
-        messages = [{"role": "user", "content": f"{FIX_INSTRUCTION}\n\n{paragraph}"}]
-        inputs = diff_processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt",
-        ).to(diff_model.device)
-        prompt_token_count = inputs["input_ids"].shape[-1]
-
-        streamer = QueueDiffusionStreamer(
-            tokenizer=diff_processor.tokenizer,
-            prompt_token_count=prompt_token_count,
-            skip_prompt=True,
-            skip_special_tokens=True,
-        )
-        generation_thread = threading.Thread(
-            target=diff_model.generate,
-            kwargs=dict(**inputs, max_new_tokens=512, streamer=streamer),
-        )
-        generation_thread.start()
-
-        for partial in streamer:
-            html, pct = word_diff_html(paragraph, partial)
-            yield f"### DiffusionGemma (block diffusion) — {pct}% of words changed so far", html
-
-        generation_thread.join()
+        fix = fix_with_diffusiongemma(paragraph)
+        html, pct = word_diff_html(paragraph, fix)
+        return f"### DiffusionGemma (block diffusion) — {pct}% of words changed", html
     except Exception as e:
-        yield "### DiffusionGemma (block diffusion) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
+        return "### DiffusionGemma (block diffusion) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
 
 
 CUSTOM_CSS = """
@@ -174,8 +123,8 @@ with gr.Blocks(title="Diffusion Gemma Showdown", css=CUSTOM_CSS) as demo:
     gr.Markdown(
         "# Diffusion Gemma Showdown\n"
         "Paste a paragraph with a mistake in it. Watch how an autoregressive model "
-        "(Gemma 4) and a diffusion model (DiffusionGemma) each fix it live, side by side — "
-        "and see exactly how many words each one actually changed."
+        "(Gemma 4) and a diffusion model (DiffusionGemma) each fix it — and see exactly "
+        "how many words each one actually changed."
     )
     input_box = gr.Textbox(
         label="Paragraph with a mistake in it",
@@ -192,15 +141,13 @@ with gr.Blocks(title="Diffusion Gemma Showdown", css=CUSTOM_CSS) as demo:
             diffusion_title = gr.Markdown("### DiffusionGemma (block diffusion)")
             diffusion_output = gr.HTML()
 
-    # Two separate listeners on the same click — Gradio runs both concurrently,
-    # so each panel streams independently instead of waiting on the other.
     run_button.click(
         fn=stream_gemma4,
         inputs=[input_box],
         outputs=[gemma4_title, gemma4_output],
     )
     run_button.click(
-        fn=stream_diffusiongemma,
+        fn=run_diffusiongemma,
         inputs=[input_box],
         outputs=[diffusion_title, diffusion_output],
     )
