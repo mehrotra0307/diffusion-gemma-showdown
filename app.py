@@ -1,10 +1,11 @@
 import os
 import difflib
+import threading
 
 import gradio as gr
 import spaces
 from google import genai
-from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor
+from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor, TextDiffusionStreamer
 
 GEMMA4_MODEL_ID = "gemma-4-26b-a4b-it"
 DIFFUSIONGEMMA_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
@@ -20,27 +21,6 @@ diff_model = DiffusionGemmaForBlockDiffusion.from_pretrained(
     DIFFUSIONGEMMA_MODEL_ID, dtype="auto", device_map="auto",
 )
 diff_processor = AutoProcessor.from_pretrained(DIFFUSIONGEMMA_MODEL_ID)
-
-
-@spaces.GPU(duration=90, size="xlarge")
-def fix_with_diffusiongemma(paragraph: str) -> str:
-    messages = [{"role": "user", "content": f"{FIX_INSTRUCTION}\n\n{paragraph}"}]
-    inputs = diff_processor.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True,
-        return_dict=True, return_tensors="pt",
-    ).to(diff_model.device)
-    output = diff_model.generate(**inputs, max_new_tokens=512)
-    text = diff_processor.decode(output[0], skip_special_tokens=True)
-    return text.strip()
-
-
-def fix_with_gemma4(paragraph: str) -> str:
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    response = client.models.generate_content(
-        model=GEMMA4_MODEL_ID,
-        contents=f"{FIX_INSTRUCTION}\n\n{paragraph}",
-    )
-    return response.text.strip()
 
 
 def word_diff_html(original: str, fixed: str):
@@ -61,32 +41,61 @@ def word_diff_html(original: str, fixed: str):
     return " ".join(html_parts), pct
 
 
-def run_comparison(paragraph: str):
+def stream_gemma4(paragraph: str):
+    """Yields (label, html) repeatedly as Gemma 4's answer streams in, word by word."""
+    if not paragraph.strip():
+        yield "### Gemma 4 (autoregressive)", ""
+        return
     try:
-        gemma4_fix = fix_with_gemma4(paragraph)
-        gemma4_html, gemma4_pct = word_diff_html(paragraph, gemma4_fix)
-        gemma4_label = f"### Gemma 4 (autoregressive) — {gemma4_pct}% of words changed"
+        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        partial = ""
+        for chunk in client.models.generate_content_stream(
+            model=GEMMA4_MODEL_ID,
+            contents=f"{FIX_INSTRUCTION}\n\n{paragraph}",
+        ):
+            if chunk.text:
+                partial += chunk.text
+                html, pct = word_diff_html(paragraph, partial)
+                yield f"### Gemma 4 (autoregressive) — {pct}% of words changed so far", html
     except Exception as e:
-        gemma4_label = "### Gemma 4 (autoregressive) — request failed"
-        gemma4_html = f"<p><em>{type(e).__name__}: {e}</em></p>"
+        yield "### Gemma 4 (autoregressive) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
 
+
+@spaces.GPU(duration=90, size="xlarge")
+def stream_diffusiongemma(paragraph: str):
+    """Yields (label, html) repeatedly as DiffusionGemma denoises the block in place."""
+    if not paragraph.strip():
+        yield "### DiffusionGemma (block diffusion)", ""
+        return
     try:
-        diffusion_fix = fix_with_diffusiongemma(paragraph)
-        diffusion_html, diffusion_pct = word_diff_html(paragraph, diffusion_fix)
-        diffusion_label = f"### DiffusionGemma (block diffusion) — {diffusion_pct}% of words changed"
-    except Exception as e:
-        diffusion_label = "### DiffusionGemma (block diffusion) — request failed"
-        diffusion_html = f"<p><em>{type(e).__name__}: {e}</em></p>"
+        messages = [{"role": "user", "content": f"{FIX_INSTRUCTION}\n\n{paragraph}"}]
+        inputs = diff_processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True,
+            return_dict=True, return_tensors="pt",
+        ).to(diff_model.device)
 
-    return gemma4_label, gemma4_html, diffusion_label, diffusion_html
+        streamer = TextDiffusionStreamer(tokenizer=diff_processor.tokenizer, skip_special_tokens=True)
+        generation_thread = threading.Thread(
+            target=diff_model.generate,
+            kwargs=dict(**inputs, max_new_tokens=512, streamer=streamer),
+        )
+        generation_thread.start()
+
+        for partial in streamer:
+            html, pct = word_diff_html(paragraph, partial)
+            yield f"### DiffusionGemma (block diffusion) — {pct}% of words changed so far", html
+
+        generation_thread.join()
+    except Exception as e:
+        yield "### DiffusionGemma (block diffusion) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
 
 
 with gr.Blocks(title="Diffusion Gemma Showdown") as demo:
     gr.Markdown(
         "# Diffusion Gemma Showdown\n"
         "Paste a paragraph with a mistake in it. Watch how an autoregressive model "
-        "(Gemma 4) and a diffusion model (DiffusionGemma) each fix it — and see exactly "
-        "how many words each one actually changed."
+        "(Gemma 4) and a diffusion model (DiffusionGemma) each fix it live, side by side — "
+        "and see exactly how many words each one actually changed."
     )
     input_box = gr.Textbox(
         label="Paragraph with a mistake in it",
@@ -103,10 +112,17 @@ with gr.Blocks(title="Diffusion Gemma Showdown") as demo:
             diffusion_title = gr.Markdown("### DiffusionGemma (block diffusion)")
             diffusion_output = gr.HTML()
 
+    # Two separate listeners on the same click — Gradio runs both concurrently,
+    # so each panel streams independently instead of waiting on the other.
     run_button.click(
-        fn=run_comparison,
+        fn=stream_gemma4,
         inputs=[input_box],
-        outputs=[gemma4_title, gemma4_output, diffusion_title, diffusion_output],
+        outputs=[gemma4_title, gemma4_output],
+    )
+    run_button.click(
+        fn=stream_diffusiongemma,
+        inputs=[input_box],
+        outputs=[diffusion_title, diffusion_output],
     )
 
 if __name__ == "__main__":
