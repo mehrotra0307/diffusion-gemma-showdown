@@ -12,6 +12,25 @@ GEMMA4_MODEL_ID = "gemma-4-26b-a4b-it"
 DIFFUSIONGEMMA_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 
 _STOP = object()
+_LEADING_ROLE_MARKERS = ("user", "model", "thought")
+
+
+def _strip_leading_role_markers(text: str) -> str:
+    """Safety net: if a chat-template role marker (e.g. a stray 'model' or 'thought')
+    survives at the very start of the decoded text, drop it. Only strips whole leading
+    words that exactly match a known marker, so normal sentences are never touched."""
+    text = text.lstrip()
+    changed = True
+    while changed:
+        changed = False
+        for marker in _LEADING_ROLE_MARKERS:
+            if text == marker:
+                text = ""
+                changed = True
+            elif text.startswith(marker + " "):
+                text = text[len(marker):].lstrip()
+                changed = True
+    return text
 
 
 class QueueDiffusionStreamer(TextDiffusionStreamer):
@@ -21,22 +40,28 @@ class QueueDiffusionStreamer(TextDiffusionStreamer):
     for confirmed text) and pushes plain strings into a queue instead, so we can
     read it like a normal streaming iterator from app.py."""
 
-    def __init__(self, tokenizer, **kwargs):
+    def __init__(self, tokenizer, prompt_token_count: int = 0, **kwargs):
         super().__init__(tokenizer, **kwargs)
         self.text_queue = queue.Queue()
         self._confirmed = ""
+        # put_draft() has no built-in prompt-skipping (unlike put()/on_finalized_text,
+        # which respect skip_prompt) — it decodes whatever tensor it's handed. Since
+        # the draft tensor is the whole canvas (prompt + answer together), we slice
+        # off the prompt ourselves using its known token length.
+        self.prompt_token_count = prompt_token_count
 
     def put_draft(self, value, **kwargs):
         if len(value.shape) > 1 and value.shape[0] > 1:
             raise ValueError("QueueDiffusionStreamer only supports batch size 1")
         elif len(value.shape) > 1:
             value = value[0]
+        value = value[self.prompt_token_count:]
         draft_text = self.tokenizer.decode(value, skip_special_tokens=True)
-        self.text_queue.put(draft_text)
+        self.text_queue.put(_strip_leading_role_markers(draft_text))
 
     def on_finalized_text(self, text: str, stream_end: bool = False):
         self._confirmed += text
-        self.text_queue.put(self._confirmed)
+        self.text_queue.put(_strip_leading_role_markers(self._confirmed))
         if stream_end:
             self.text_queue.put(_STOP)
 
@@ -112,8 +137,14 @@ def stream_diffusiongemma(paragraph: str):
             messages, tokenize=True, add_generation_prompt=True,
             return_dict=True, return_tensors="pt",
         ).to(diff_model.device)
+        prompt_token_count = inputs["input_ids"].shape[-1]
 
-        streamer = QueueDiffusionStreamer(tokenizer=diff_processor.tokenizer, skip_special_tokens=True)
+        streamer = QueueDiffusionStreamer(
+            tokenizer=diff_processor.tokenizer,
+            prompt_token_count=prompt_token_count,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
         generation_thread = threading.Thread(
             target=diff_model.generate,
             kwargs=dict(**inputs, max_new_tokens=512, streamer=streamer),
