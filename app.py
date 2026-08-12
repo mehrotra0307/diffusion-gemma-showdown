@@ -62,14 +62,21 @@ def word_diff_html(original: str, fixed: str):
 
 
 def run_comparison(paragraph: str):
-    gemma4_fix = fix_with_gemma4(paragraph)
-    diffusion_fix = fix_with_diffusiongemma(paragraph)
+    try:
+        gemma4_fix = fix_with_gemma4(paragraph)
+        gemma4_html, gemma4_pct = word_diff_html(paragraph, gemma4_fix)
+        gemma4_label = f"### Gemma 4 (autoregressive) — {gemma4_pct}% of words changed"
+    except Exception as e:
+        gemma4_label = "### Gemma 4 (autoregressive) — request failed"
+        gemma4_html = f"<p><em>{type(e).__name__}: {e}</em></p>"
 
-    gemma4_html, gemma4_pct = word_diff_html(paragraph, gemma4_fix)
-    diffusion_html, diffusion_pct = word_diff_html(paragraph, diffusion_fix)
-
-    gemma4_label = f"### Gemma 4 (autoregressive) — {gemma4_pct}% of words changed"
-    diffusion_label = f"### DiffusionGemma (block diffusion) — {diffusion_pct}% of words changed"
+    try:
+        diffusion_fix = fix_with_diffusiongemma(paragraph)
+        diffusion_html, diffusion_pct = word_diff_html(paragraph, diffusion_fix)
+        diffusion_label = f"### DiffusionGemma (block diffusion) — {diffusion_pct}% of words changed"
+    except Exception as e:
+        diffusion_label = "### DiffusionGemma (block diffusion) — request failed"
+        diffusion_html = f"<p><em>{type(e).__name__}: {e}</em></p>"
 
     return gemma4_label, gemma4_html, diffusion_label, diffusion_html
 
