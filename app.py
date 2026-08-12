@@ -1,5 +1,7 @@
 import os
+import time
 import difflib
+import concurrent.futures
 
 import gradio as gr
 import spaces
@@ -8,6 +10,7 @@ from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor
 
 GEMMA4_MODEL_ID = "gemma-4-26b-a4b-it"
 DIFFUSIONGEMMA_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
+GEMMA4_CHUNK_TIMEOUT_SECONDS = 45
 
 _LEADING_ROLE_MARKERS = ("user", "model", "thought")
 
@@ -61,23 +64,54 @@ def word_diff_html(original: str, fixed: str):
     return " ".join(html_parts), pct
 
 
+def _gemma4_chunk_generator(paragraph: str):
+    """Runs in a worker thread. A plain generator wrapping the SDK call — all the
+    timeout/logging logic lives in stream_gemma4, which pulls from this one item
+    at a time so a stuck network call can't hang the app forever."""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    for chunk in client.models.generate_content_stream(
+        model=GEMMA4_MODEL_ID,
+        contents=f"{FIX_INSTRUCTION}\n\n{paragraph}",
+    ):
+        if chunk.text:
+            yield chunk.text
+
+
 def stream_gemma4(paragraph: str):
-    """Yields (label, html) repeatedly as Gemma 4's answer streams in, word by word."""
+    """Yields (label, html) repeatedly as Gemma 4's answer streams in, word by word.
+    Each individual step is bounded by GEMMA4_CHUNK_TIMEOUT_SECONDS so a stuck
+    network call fails loudly instead of hanging indefinitely."""
     if not paragraph.strip():
         yield "### Gemma 4 (autoregressive)", ""
         return
+
+    start = time.monotonic()
+    print(f"[gemma4] request starting", flush=True)
     try:
-        client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         partial = ""
-        for chunk in client.models.generate_content_stream(
-            model=GEMMA4_MODEL_ID,
-            contents=f"{FIX_INSTRUCTION}\n\n{paragraph}",
-        ):
-            if chunk.text:
-                partial += chunk.text
+        gen = _gemma4_chunk_generator(paragraph)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            while True:
+                future = executor.submit(next, gen, None)
+                try:
+                    chunk_text = future.result(timeout=GEMMA4_CHUNK_TIMEOUT_SECONDS)
+                except concurrent.futures.TimeoutError:
+                    elapsed = time.monotonic() - start
+                    print(f"[gemma4] TIMED OUT waiting for next chunk, elapsed={elapsed:.1f}s", flush=True)
+                    raise TimeoutError(
+                        f"No response from Gemma 4 for {GEMMA4_CHUNK_TIMEOUT_SECONDS}s "
+                        f"(request running {elapsed:.1f}s total)"
+                    )
+                if chunk_text is None:
+                    break
+                partial += chunk_text
+                elapsed = time.monotonic() - start
+                print(f"[gemma4] chunk at {elapsed:.1f}s: {chunk_text[:60]!r}", flush=True)
                 html, pct = word_diff_html(paragraph, partial)
                 yield f"### Gemma 4 (autoregressive) — {pct}% of words changed so far", html
+        print(f"[gemma4] done in {time.monotonic() - start:.1f}s", flush=True)
     except Exception as e:
+        print(f"[gemma4] ERROR after {time.monotonic() - start:.1f}s: {type(e).__name__}: {e}", flush=True)
         yield "### Gemma 4 (autoregressive) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
 
 
@@ -85,16 +119,21 @@ def stream_gemma4(paragraph: str):
 def fix_with_diffusiongemma(paragraph: str) -> str:
     """Plain, blocking call — no streaming, no background thread. This is the
     exact pattern that ran in ~10 seconds before streaming was added."""
+    start = time.monotonic()
+    print(f"[diffusiongemma] request starting", flush=True)
     messages = [{"role": "user", "content": f"{FIX_INSTRUCTION}\n\n{paragraph}"}]
     inputs = diff_processor.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True,
         return_dict=True, return_tensors="pt",
     ).to(diff_model.device)
     prompt_token_count = inputs["input_ids"].shape[-1]
+    print(f"[diffusiongemma] prompt tokenized at {time.monotonic() - start:.1f}s, calling generate()", flush=True)
 
     output = diff_model.generate(**inputs, max_new_tokens=512)
+    print(f"[diffusiongemma] generate() returned at {time.monotonic() - start:.1f}s", flush=True)
     generated_tokens = output[0][prompt_token_count:]
     text = diff_processor.decode(generated_tokens, skip_special_tokens=True)
+    print(f"[diffusiongemma] done in {time.monotonic() - start:.1f}s", flush=True)
     return _strip_leading_role_markers(text.strip())
 
 
