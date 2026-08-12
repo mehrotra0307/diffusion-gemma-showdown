@@ -1,6 +1,7 @@
 import os
 import difflib
 import threading
+import queue
 
 import gradio as gr
 import spaces
@@ -9,6 +10,44 @@ from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor, TextDif
 
 GEMMA4_MODEL_ID = "gemma-4-26b-a4b-it"
 DIFFUSIONGEMMA_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
+
+_STOP = object()
+
+
+class QueueDiffusionStreamer(TextDiffusionStreamer):
+    """TextDiffusionStreamer is built to print ANSI colors to a terminal, not to
+    hand data back to code — it isn't iterable at all. This subclass intercepts
+    its two real callbacks (put_draft for in-progress denoising, on_finalized_text
+    for confirmed text) and pushes plain strings into a queue instead, so we can
+    read it like a normal streaming iterator from app.py."""
+
+    def __init__(self, tokenizer, **kwargs):
+        super().__init__(tokenizer, **kwargs)
+        self.text_queue = queue.Queue()
+        self._confirmed = ""
+
+    def put_draft(self, value, **kwargs):
+        if len(value.shape) > 1 and value.shape[0] > 1:
+            raise ValueError("QueueDiffusionStreamer only supports batch size 1")
+        elif len(value.shape) > 1:
+            value = value[0]
+        draft_text = self.tokenizer.decode(value, skip_special_tokens=True)
+        self.text_queue.put(draft_text)
+
+    def on_finalized_text(self, text: str, stream_end: bool = False):
+        self._confirmed += text
+        self.text_queue.put(self._confirmed)
+        if stream_end:
+            self.text_queue.put(_STOP)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = self.text_queue.get()
+        if value is _STOP:
+            raise StopIteration
+        return value
 
 FIX_INSTRUCTION = (
     "The paragraph below contains exactly one factual or spelling error. "
@@ -74,7 +113,7 @@ def stream_diffusiongemma(paragraph: str):
             return_dict=True, return_tensors="pt",
         ).to(diff_model.device)
 
-        streamer = TextDiffusionStreamer(tokenizer=diff_processor.tokenizer, skip_special_tokens=True)
+        streamer = QueueDiffusionStreamer(tokenizer=diff_processor.tokenizer, skip_special_tokens=True)
         generation_thread = threading.Thread(
             target=diff_model.generate,
             kwargs=dict(**inputs, max_new_tokens=512, streamer=streamer),
@@ -90,7 +129,17 @@ def stream_diffusiongemma(paragraph: str):
         yield "### DiffusionGemma (block diffusion) — request failed", f"<p><em>{type(e).__name__}: {e}</em></p>"
 
 
-with gr.Blocks(title="Diffusion Gemma Showdown") as demo:
+CUSTOM_CSS = """
+mark {
+    background-color: #ff8a00;
+    color: #000000;
+    font-weight: 700;
+    padding: 0.05em 0.25em;
+    border-radius: 3px;
+}
+"""
+
+with gr.Blocks(title="Diffusion Gemma Showdown", css=CUSTOM_CSS) as demo:
     gr.Markdown(
         "# Diffusion Gemma Showdown\n"
         "Paste a paragraph with a mistake in it. Watch how an autoregressive model "
