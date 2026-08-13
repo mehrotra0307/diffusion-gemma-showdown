@@ -32,9 +32,9 @@ def _strip_leading_role_markers(text: str) -> str:
 
 
 FIX_INSTRUCTION = (
-    "The paragraph below contains exactly one factual or spelling error. "
+    "The paragraph below contains one or more factual or spelling errors. "
     "Return the corrected paragraph only, with no explanation, no preamble, "
-    "and no changes other than what is needed to fix that one error."
+    "and no changes other than what is needed to fix those errors."
 )
 
 # Loaded once when the Space starts up, kept warm — not reloaded per request.
