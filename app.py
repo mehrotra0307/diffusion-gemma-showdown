@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import queue
 import difflib
@@ -13,24 +14,18 @@ DIFFUSIONGEMMA_MODEL_ID = "google/diffusiongemma-26B-A4B-it"
 
 _STOP = object()
 _LEADING_ROLE_MARKERS = ("user", "model", "thought")
+_ROLE_MARKER_PATTERN = re.compile(
+    r"^(?:\s*(?:" + "|".join(_LEADING_ROLE_MARKERS) + r")\b[:\s]*)+",
+    re.IGNORECASE,
+)
 
 
 def _strip_leading_role_markers(text: str) -> str:
     """Safety net: if a chat-template role marker (e.g. a stray 'model' or 'thought')
-    survives at the very start of the decoded text, drop it. Only strips whole leading
-    words that exactly match a known marker, so normal sentences are never touched."""
-    text = text.lstrip()
-    changed = True
-    while changed:
-        changed = False
-        for marker in _LEADING_ROLE_MARKERS:
-            if text == marker:
-                text = ""
-                changed = True
-            elif text.startswith(marker + " "):
-                text = text[len(marker):].lstrip()
-                changed = True
-    return text
+    survives at the very start of the decoded text, drop it. Matches the marker word
+    regardless of what whitespace/punctuation follows it (space, newline, colon,
+    stacked markers), so formatting variations can't slip past this like before."""
+    return _ROLE_MARKER_PATTERN.sub("", text).lstrip()
 
 
 class QueueDiffusionStreamer(TextDiffusionStreamer):
