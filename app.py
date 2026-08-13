@@ -71,7 +71,7 @@ def fix_with_gemma4(paragraph: str) -> str:
     return response.text.strip()
 
 
-@spaces.GPU(duration=45, size="xlarge")
+@spaces.GPU(duration=18, size="xlarge")
 def fix_with_diffusiongemma(paragraph: str) -> str:
     messages = [{"role": "user", "content": f"{FIX_INSTRUCTION}\n\n{paragraph}"}]
     inputs = diff_processor.apply_chat_template(
