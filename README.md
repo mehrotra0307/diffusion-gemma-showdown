@@ -23,6 +23,7 @@ Status: work in progress.
 [![Watch the demo](https://img.youtube.com/vi/FZDjUYj9fp8/maxresdefault.jpg)](https://www.youtube.com/watch?v=FZDjUYj9fp8)
 
 Full project write-up: [ashishmehrotra.com/projects/diffusion-gemma-showdown](https://ashishmehrotra.com/projects/diffusion-gemma-showdown)
+
 Related blog post: [ashishmehrotra.com/blog/diffusiongemma-the-ai-that-writes-every-word-at-once](https://ashishmehrotra.com/blog/diffusiongemma-the-ai-that-writes-every-word-at-once)
 
 ## What's here
