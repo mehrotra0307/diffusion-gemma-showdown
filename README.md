@@ -18,6 +18,13 @@ This project compares Gemma 4 (autoregressive — writes left to right, one toke
 
 Status: work in progress.
 
+## 🎥 Watch it in action
+
+[![Watch the demo](https://img.youtube.com/vi/FZDjUYj9fp8/maxresdefault.jpg)](https://www.youtube.com/watch?v=FZDjUYj9fp8)
+
+Full project write-up: [ashishmehrotra.com/projects/diffusion-gemma-showdown](https://ashishmehrotra.com/projects/diffusion-gemma-showdown)
+Related blog post: [ashishmehrotra.com/blog/diffusiongemma-the-ai-that-writes-every-word-at-once](https://ashishmehrotra.com/blog/diffusiongemma-the-ai-that-writes-every-word-at-once)
+
 ## What's here
 
 - `app.py` — the Hugging Face Space: paste a paragraph, see both models fix it live, side by side.
